@@ -1,16 +1,92 @@
-/// <reference path="../types.d.ts" />
+import type { WebSocket } from 'ws';
+import type { MessageEvent } from 'ws';
+import EventEmitter from './EventEmitter.js';
+import Logger from './Logger.js';
+import * as parser from './parser.js';
+import type { IRCMessage } from './parser.js';
+import Queue from './Queue.js';
+import * as utils from './utils.js';
+import type {
+	ClientOptions,
+	ChannelName,
+	GlobalUserstate,
+	Userstate
+} from '../types.js';
 
+// Determine WebSocket implementation (browser vs Node.js)
+declare const global: any;
+declare const window: any;
 const _global = typeof global !== 'undefined' ? global : typeof window !== 'undefined' ? window : {};
-const _WebSocket = _global.WebSocket ?? require('ws');
-const EventEmitter = require('./EventEmitter');
-const Logger = require('./Logger');
-const parser = require('./parser');
-const Queue = require('./Queue');
-const _ = require('./utils');
+
+// Get WebSocket implementation
+function getWebSocket(): typeof WebSocket {
+	if (_global.WebSocket) {
+		return _global.WebSocket;
+	}
+	// For Node.js, import ws dynamically
+	// This will be tree-shaken out in browser builds
+	try {
+		// @ts-ignore
+		return require('ws');
+	} catch {
+		throw new Error('WebSocket not available');
+	}
+}
+
+const _WebSocket = getWebSocket();
+
+interface SendCommandOptions {
+	delay?: number | null;
+	channel?: string;
+	command: string;
+	tags?: Record<string, string>;
+}
+
+interface SendMessageOptions {
+	channel: string;
+	message: string;
+	tags?: Record<string, string>;
+}
 
 // Client instance
-class ClientBase extends EventEmitter {
-	constructor(opts) {
+export default class ClientBase extends EventEmitter {
+	opts: ClientOptions;
+	clientId: string | null;
+	_globalDefaultChannel: ChannelName;
+	_skipMembership: boolean;
+
+	maxReconnectAttempts: number;
+	maxReconnectInterval: number;
+	reconnect: boolean;
+	reconnectDecay: number;
+	reconnectInterval: number;
+	reconnecting: boolean;
+	reconnections: number;
+	reconnectTimer: number;
+	currentLatency: number;
+	latency: Date;
+	secure: boolean;
+	server: string;
+	port: number;
+
+	pingLoop: ReturnType<typeof setInterval> | null;
+	pingTimeout: ReturnType<typeof setTimeout> | null;
+	wasCloseCalled: boolean;
+	reason: string;
+	ws: WebSocket | null;
+
+	emotes: string;
+	emotesets: Record<string, never>;
+	username: string;
+	channels: ChannelName[];
+	globaluserstate: Partial<GlobalUserstate>;
+	userstate: Record<ChannelName, Partial<Userstate>>;
+	lastJoined: ChannelName | string;
+	moderators: Record<ChannelName, string[]>;
+
+	log: Logger;
+
+	constructor(opts?: ClientOptions) {
 		super();
 		this.opts = opts ?? {};
 		this.opts.channels = this.opts.channels ?? [];
@@ -19,7 +95,7 @@ class ClientBase extends EventEmitter {
 		this.opts.options = this.opts.options ?? {};
 
 		this.clientId = this.opts.options.clientId ?? null;
-		this._globalDefaultChannel = _.channel(this.opts.options.globalDefaultChannel ?? '#tmijs');
+		this._globalDefaultChannel = utils.channel(this.opts.options.globalDefaultChannel ?? '#tmijs') as ChannelName;
 		this._skipMembership = this.opts.options.skipMembership ?? false;
 
 		this.maxReconnectAttempts = this.opts.connection.maxReconnectAttempts ?? Infinity;
@@ -36,6 +112,8 @@ class ClientBase extends EventEmitter {
 
 		this.secure = this.opts.connection.secure ?? (!this.opts.connection.server && !this.opts.connection.port);
 
+		this.server = '';
+		this.port = 0;
 		this.pingLoop = null;
 		this.pingTimeout = null;
 		this.wasCloseCalled = false;
@@ -59,65 +137,64 @@ class ClientBase extends EventEmitter {
 
 		try {
 			this.log.setLevel(this.opts.options.debug ? 'info' : 'error');
-		}
-		catch(err) {}
+		} catch (err) {}
 
 		// Format the channel names
-		this.opts.channels.forEach((part, index, theArray) => theArray[index] = _.channel(part)
-		);
+		this.opts.channels.forEach((part, index, theArray) => {
+			theArray[index] = utils.channel(part);
+		});
 
 		this.setMaxListeners(0);
 	}
+
 	/** @deprecated */
-	api() {
+	api(): void {
 		throw new Error('The Client.api() method has been removed.');
 	}
+
 	// Handle parsed chat server message
-	handleMessage(message) {
-		if(!message) {
+	handleMessage(message: IRCMessage | null): void {
+		if (!message) {
 			return;
 		}
 
-		if(this.listenerCount('raw_message')) {
+		if (this.listenerCount('raw_message')) {
 			this.emit('raw_message', JSON.parse(JSON.stringify(message)), message);
 		}
 
-		const channel = _.channel(message.params[0] ?? null);
+		const channel = utils.channel(message.params[0] ?? '') as ChannelName;
 		const msg = message.params[1] ?? null;
-		const msgid = message.tags['msg-id'] ?? null;
+		const msgid = (message.tags['msg-id'] as string) ?? null;
 
 		// Parse badges, badge-info and emotes
-		const tags = message.tags = parser.badges(parser.badgeInfo(parser.emotes(message.tags)));
+		const tags = message.tags = parser.badges(parser.badgeInfo(parser.emotes(message.tags as any))) as any;
 
 		// Transform IRCv3 tags
-		for(const key in tags) {
-			if(key === 'emote-sets' || key === 'ban-duration' || key === 'bits') {
+		for (const key in tags) {
+			if (key === 'emote-sets' || key === 'ban-duration' || key === 'bits') {
 				continue;
 			}
-			let value = tags[key];
-			if(typeof value === 'boolean') {
+			let value: any = tags[key];
+			if (typeof value === 'boolean') {
 				value = null;
-			}
-			else if(value === '1') {
+			} else if (value === '1') {
 				value = true;
-			}
-			else if(value === '0') {
+			} else if (value === '0') {
 				value = false;
-			}
-			else if(typeof value === 'string') {
-				value = _.unescapeIRC(value);
+			} else if (typeof value === 'string') {
+				value = utils.unescapeIRC(value);
 			}
 			tags[key] = value;
 		}
 
 		// Messages with no prefix
-		if(message.prefix === null) {
-			switch(message.command) {
+		if (message.prefix === null) {
+			switch (message.command) {
 				// Received PING from server
 				case 'PING':
 					this.emit('ping');
-					if(this._isConnected()) {
-						this.ws.send('PONG');
+					if (this._isConnected()) {
+						this.ws!.send('PONG');
 					}
 					break;
 
@@ -126,7 +203,7 @@ class ClientBase extends EventEmitter {
 					this.currentLatency = (new Date().getTime() - this.latency.getTime()) / 1000;
 					this.emits([ 'pong', '_promisePing' ], [ [ this.currentLatency ] ]);
 
-					clearTimeout(this.pingTimeout);
+					clearTimeout(this.pingTimeout!);
 					break;
 				}
 
@@ -137,8 +214,8 @@ class ClientBase extends EventEmitter {
 		}
 
 		// Messages with "tmi.twitch.tv" as a prefix
-		else if(message.prefix === 'tmi.twitch.tv') {
-			switch(message.command) {
+		else if (message.prefix === 'tmi.twitch.tv') {
+			switch (message.command) {
 				case '002':
 				case '003':
 				case '004':
@@ -163,35 +240,35 @@ class ClientBase extends EventEmitter {
 					// Set an internal ping timeout check interval
 					this.pingLoop = setInterval(() => {
 						// Make sure the connection is opened before sending the message
-						if(this._isConnected()) {
-							this.ws.send('PING');
+						if (this._isConnected()) {
+							this.ws!.send('PING');
 						}
 						this.latency = new Date();
 						this.pingTimeout = setTimeout(() => {
-							if(this.ws !== null) {
+							if (this.ws !== null) {
 								this.wasCloseCalled = false;
 								this.log.error('Ping timeout.');
 								this.ws.close();
 
-								clearInterval(this.pingLoop);
-								clearTimeout(this.pingTimeout);
+								clearInterval(this.pingLoop!);
+								clearTimeout(this.pingTimeout!);
 							}
-						}, this.opts.connection.timeout ?? 9999);
+						}, this.opts.connection?.timeout ?? 9999);
 					}, 60000);
 
 					// Join all the channels from the config with an interval
-					let joinInterval = this.opts.options.joinInterval ?? 2000;
-					if(joinInterval < 300) {
+					let joinInterval = this.opts.options?.joinInterval ?? 2000;
+					if (joinInterval < 300) {
 						joinInterval = 300;
 					}
 					const joinQueue = new Queue(joinInterval);
-					const joinChannels = [ ...new Set([ ...this.opts.channels, ...this.channels ]) ];
+					const joinChannels = [ ...new Set([ ...this.opts.channels!, ...this.channels ]) ];
 					this.channels = [];
 
-					for(let i = 0; i < joinChannels.length; i++) {
+					for (let i = 0; i < joinChannels.length; i++) {
 						const channel = joinChannels[i];
 						joinQueue.add(() => {
-							if(this._isConnected()) {
+							if (this._isConnected()) {
 								this.join(channel).catch(err => this.log.error(err));
 							}
 						});
@@ -210,7 +287,7 @@ class ClientBase extends EventEmitter {
 					const noticeAndNull = [ noticeArr, nullArr ];
 					const noticeAndMsgid = [ noticeArr, msgidArr ];
 					const basicLog = `[${channel}] ${msg}`;
-					switch(msgid) {
+					switch (msgid) {
 						// This room is now in subscribers-only mode.
 						case 'subs_on':
 							this.log.info(`[${channel}] This room is now in subscribers-only mode.`);
@@ -260,10 +337,10 @@ class ClientBase extends EventEmitter {
 
 						// The moderators of this room are: [..., ...]
 						case 'room_mods': {
-							const listSplit = msg.split(': ');
+							const listSplit = (msg || '').split(': ');
 							const mods = (listSplit.length > 1 ? listSplit[1] : '').toLowerCase()
-							.split(', ')
-							.filter(n => n);
+								.split(', ')
+								.filter(n => n);
 
 							this.emits([ '_promiseMods', 'mods' ], [ [ null, mods ], [ channel, mods ] ]);
 							break;
@@ -276,10 +353,10 @@ class ClientBase extends EventEmitter {
 
 						// The VIPs of this channel are: [..., ...]
 						case 'vips_success': {
-							const listSplit = (msg.endsWith('.') ? msg.slice(0, -1) : msg).split(': ');
+							const listSplit = ((msg || '').endsWith('.') ? (msg || '').slice(0, -1) : msg || '').split(': ');
 							const vips = (listSplit.length > 1 ? listSplit[1] : '').toLowerCase()
-							.split(', ')
-							.filter(n => n);
+								.split(', ')
+								.filter(n => n);
 
 							this.emits([ '_promiseVips', 'vips' ], [ [ null, vips ], [ channel, vips ] ]);
 							break;
@@ -413,7 +490,7 @@ class ClientBase extends EventEmitter {
 						// Host command success
 						case 'hosts_remaining': {
 							this.log.info(basicLog);
-							const remainingHost = (!isNaN(msg[0]) ? parseInt(msg[0]) : 0);
+							const remainingHost = (!isNaN(+(msg || '')[0]) ? parseInt((msg || '')[0]) : 0);
 							this.emits([ 'notice', '_promiseHost' ], [ noticeArr, [ null, ~~remainingHost ] ]);
 							break;
 						}
@@ -634,28 +711,25 @@ class ClientBase extends EventEmitter {
 							break;
 
 						default:
-							if(msg.includes('Login unsuccessful') || msg.includes('Login authentication failed')) {
+							if ((msg || '').includes('Login unsuccessful') || (msg || '').includes('Login authentication failed')) {
 								this.wasCloseCalled = false;
 								this.reconnect = false;
-								this.reason = msg;
+								this.reason = msg || '';
 								this.log.error(this.reason);
-								this.ws.close();
-							}
-							else if(msg.includes('Error logging in') || msg.includes('Improperly formatted auth')) {
+								this.ws!.close();
+							} else if ((msg || '').includes('Error logging in') || (msg || '').includes('Improperly formatted auth')) {
 								this.wasCloseCalled = false;
 								this.reconnect = false;
-								this.reason = msg;
+								this.reason = msg || '';
 								this.log.error(this.reason);
-								this.ws.close();
-							}
-							else if(msg.includes('Invalid NICK')) {
+								this.ws!.close();
+							} else if ((msg || '').includes('Invalid NICK')) {
 								this.wasCloseCalled = false;
 								this.reconnect = false;
 								this.reason = 'Invalid NICK.';
 								this.log.error(this.reason);
-								this.ws.close();
-							}
-							else {
+								this.ws!.close();
+							} else {
 								this.log.warn(`Could not parse NOTICE from tmi.twitch.tv:\n${JSON.stringify(message, null, 4)}`);
 								this.emit('notice', channel, msgid, msg);
 							}
@@ -666,17 +740,17 @@ class ClientBase extends EventEmitter {
 
 				// Handle subanniversary / resub
 				case 'USERNOTICE': {
-					const username = tags['display-name'] || tags['login'];
-					const plan = tags['msg-param-sub-plan'] ?? '';
-					const planName = _.unescapeIRC(tags['msg-param-sub-plan-name'] ?? '') || null;
+					const username = (tags['display-name'] as string) || (tags['login'] as string);
+					const plan = (tags['msg-param-sub-plan'] as string) ?? '';
+					const planName = utils.unescapeIRC((tags['msg-param-sub-plan-name'] as string) ?? '') || null;
 					const prime = plan.includes('Prime');
 					const methods = { prime, plan, planName };
-					const streakMonths = ~~(tags['msg-param-streak-months'] || 0);
-					const recipient = tags['msg-param-recipient-display-name'] || tags['msg-param-recipient-user-name'];
-					const giftSubCount = ~~tags['msg-param-mass-gift-count'];
+					const streakMonths = ~~((tags['msg-param-streak-months'] as string) || 0);
+					const recipient = (tags['msg-param-recipient-display-name'] as string) || (tags['msg-param-recipient-user-name'] as string);
+					const giftSubCount = ~~(tags['msg-param-mass-gift-count'] as string);
 					tags['message-type'] = msgid;
 
-					switch(msgid) {
+					switch (msgid) {
 						// Handle resub
 						case 'resub':
 							this.emits([ 'resub', 'subanniversary' ], [
@@ -720,7 +794,7 @@ class ClientBase extends EventEmitter {
 
 						// Handle user upgrading from a gifted sub
 						case 'giftpaidupgrade': {
-							const sender = tags['msg-param-sender-name'] || tags['msg-param-sender-login'];
+							const sender = (tags['msg-param-sender-name'] as string) || (tags['msg-param-sender-login'] as string);
 							this.emit('giftpaidupgrade', channel, username, sender, tags);
 							break;
 						}
@@ -738,8 +812,8 @@ class ClientBase extends EventEmitter {
 
 						// Handle raid
 						case 'raid': {
-							const username = tags['msg-param-displayName'] || tags['msg-param-login'];
-							const viewers = +tags['msg-param-viewerCount'];
+							const username = (tags['msg-param-displayName'] as string) || (tags['msg-param-login'] as string);
+							const viewers = +(tags['msg-param-viewerCount'] as string);
 							this.emit('raided', channel, username, viewers, tags);
 							break;
 						}
@@ -755,14 +829,13 @@ class ClientBase extends EventEmitter {
 
 				// Channel is now hosting another channel or exited host mode
 				case 'HOSTTARGET': {
-					const msgSplit = msg.split(' ');
+					const msgSplit = (msg || '').split(' ');
 					const viewers = ~~msgSplit[1] || 0;
 					// Stopped hosting
-					if(msgSplit[0] === '-') {
+					if (msgSplit[0] === '-') {
 						this.log.info(`[${channel}] Exited host mode.`);
 						this.emits([ 'unhost', '_promiseUnhost' ], [ [ channel, viewers ], [ null ] ]);
 					}
-
 
 					// Now hosting
 					else {
@@ -775,20 +848,18 @@ class ClientBase extends EventEmitter {
 				// Someone has been timed out or chat has been cleared by a moderator
 				case 'CLEARCHAT':
 					// User has been banned / timed out by a moderator
-					if(message.params.length > 1) {
+					if (message.params.length > 1) {
 						// Duration returns null if it's a ban, otherwise it's a timeout
-						const duration = message.tags['ban-duration'] ?? null;
+						const duration = (message.tags['ban-duration'] as string) ?? null;
 
-						if(duration === null) {
+						if (duration === null) {
 							this.log.info(`[${channel}] ${msg} has been banned.`);
 							this.emit('ban', channel, msg, null, message.tags);
-						}
-						else {
+						} else {
 							this.log.info(`[${channel}] ${msg} has been timed out for ${duration} seconds.`);
-							this.emit('timeout', channel, msg, null, ~~duration, message.tags);
+							this.emit('timeout', channel, msg, null, ~~+duration, message.tags);
 						}
 					}
-
 
 					// Chat was cleared by a moderator
 					else {
@@ -799,9 +870,9 @@ class ClientBase extends EventEmitter {
 
 				// Someone's message has been deleted
 				case 'CLEARMSG':
-					if(message.params.length > 1) {
+					if (message.params.length > 1) {
 						const deletedMessage = msg;
-						const username = tags['login'];
+						const username = tags['login'] as string;
 						tags['message-type'] = 'messagedeleted';
 
 						this.log.info(`[${channel}] ${username}'s message has been deleted.`);
@@ -822,41 +893,41 @@ class ClientBase extends EventEmitter {
 					message.tags.username = this.username;
 
 					// Add the client to the moderators of this room
-					if(message.tags['user-type'] === 'mod') {
-						if(!this.moderators[channel]) {
+					if (message.tags['user-type'] === 'mod') {
+						if (!this.moderators[channel]) {
 							this.moderators[channel] = [];
 						}
-						if(!this.moderators[channel].includes(this.username)) {
+						if (!this.moderators[channel].includes(this.username)) {
 							this.moderators[channel].push(this.username);
 						}
 					}
 
 					// Logged in and username doesn't start with justinfan
-					if(!_.isJustinfan(this.getUsername()) && !this.userstate[channel]) {
-						this.userstate[channel] = tags;
+					if (!utils.isJustinfan(this.getUsername()) && !this.userstate[channel]) {
+						this.userstate[channel] = tags as any;
 						this.lastJoined = channel;
 						this.channels.push(channel);
 						this.log.info(`Joined ${channel}`);
-						this.emit('join', channel, _.username(this.getUsername()), true);
+						this.emit('join', channel, utils.username(this.getUsername()), true);
 					}
 
 					// Emote-sets has changed, update it
-					if(message.tags['emote-sets'] !== this.emotes) {
-						this.emotes = message.tags['emote-sets'];
+					if ((message.tags['emote-sets'] as string) !== this.emotes) {
+						this.emotes = message.tags['emote-sets'] as string;
 						this.emit('emotesets', this.emotes, null);
 					}
 
-					this.userstate[channel] = tags;
+					this.userstate[channel] = tags as any;
 					break;
 
 				// Describe non-channel-specific state informations
 				case 'GLOBALUSERSTATE':
-					this.globaluserstate = tags;
+					this.globaluserstate = tags as any;
 					this.emit('globaluserstate', tags);
 
 					// Received emote-sets and emote-sets has changed, update it
-					if(message.tags['emote-sets'] !== undefined && message.tags['emote-sets'] !== this.emotes) {
-						this.emotes = message.tags['emote-sets'];
+					if (message.tags['emote-sets'] !== undefined && (message.tags['emote-sets'] as string) !== this.emotes) {
+						this.emotes = message.tags['emote-sets'] as string;
 						this.emit('emotesets', this.emotes, null);
 					}
 					break;
@@ -865,7 +936,7 @@ class ClientBase extends EventEmitter {
 				// The message on join contains all room settings.
 				case 'ROOMSTATE':
 					// We use this notice to know if we successfully joined a channel
-					if(_.channel(this.lastJoined) === channel) {
+					if (utils.channel(this.lastJoined) === channel) {
 						this.emit('_promiseJoin', null, channel);
 					}
 
@@ -873,17 +944,16 @@ class ClientBase extends EventEmitter {
 					message.tags.channel = channel;
 					this.emit('roomstate', channel, message.tags);
 
-					if(!_.hasOwn(message.tags, 'subs-only')) {
+					if (!utils.hasOwn(message.tags, 'subs-only')) {
 						// Handle slow mode here instead of the slow_on/off notice
 						// This room is now in slow mode. You may send messages every slow_duration seconds.
-						if(_.hasOwn(message.tags, 'slow')) {
-							if(typeof message.tags.slow === 'boolean' && !message.tags.slow) {
+						if (utils.hasOwn(message.tags, 'slow')) {
+							if (typeof message.tags.slow === 'boolean' && !message.tags.slow) {
 								const disabled = [ channel, false, 0 ];
 								this.log.info(`[${channel}] This room is no longer in slow mode.`);
 								this.emits([ 'slow', 'slowmode', '_promiseSlowoff' ], [ disabled, disabled, [ null ] ]);
-							}
-							else {
-								const seconds = ~~message.tags.slow;
+							} else {
+								const seconds = ~~+(message.tags.slow as string);
 								const enabled = [ channel, true, seconds ];
 								this.log.info(`[${channel}] This room is now in slow mode.`);
 								this.emits([ 'slow', 'slowmode', '_promiseSlow' ], [ enabled, enabled, [ null ] ]);
@@ -897,14 +967,13 @@ class ClientBase extends EventEmitter {
 						// duration is in minutes (string)
 						// -1 when /followersoff (string)
 						// false when /followers with no duration (boolean)
-						if(_.hasOwn(message.tags, 'followers-only')) {
-							if(message.tags['followers-only'] === '-1') {
+						if (utils.hasOwn(message.tags, 'followers-only')) {
+							if (message.tags['followers-only'] === '-1') {
 								const disabled = [ channel, false, 0 ];
 								this.log.info(`[${channel}] This room is no longer in followers-only mode.`);
 								this.emits([ 'followersonly', 'followersmode', '_promiseFollowersoff' ], [ disabled, disabled, [ null ] ]);
-							}
-							else {
-								const minutes = ~~message.tags['followers-only'];
+							} else {
+								const minutes = ~~+(message.tags['followers-only'] as string);
 								const enabled = [ channel, true, minutes ];
 								this.log.info(`[${channel}] This room is now in follower-only mode.`);
 								this.emits([ 'followersonly', 'followersmode', '_promiseFollowers' ], [ enabled, enabled, [ null ] ]);
@@ -924,23 +993,22 @@ class ClientBase extends EventEmitter {
 		}
 
 		// Messages from jtv
-		else if(message.prefix === 'jtv') {
-			switch(message.command) {
+		else if (message.prefix === 'jtv') {
+			switch (message.command) {
 				case 'MODE':
-					if(msg === '+o') {
+					if (msg === '+o') {
 						// Add username to the moderators
-						if(!this.moderators[channel]) {
+						if (!this.moderators[channel]) {
 							this.moderators[channel] = [];
 						}
-						if(!this.moderators[channel].includes(message.params[2])) {
+						if (!this.moderators[channel].includes(message.params[2])) {
 							this.moderators[channel].push(message.params[2]);
 						}
 
 						this.emit('mod', channel, message.params[2]);
-					}
-					else if(msg === '-o') {
+					} else if (msg === '-o') {
 						// Remove username from the moderators
-						if(!this.moderators[channel]) {
+						if (!this.moderators[channel]) {
 							this.moderators[channel] = [];
 						}
 						this.moderators[channel].filter(value => value !== message.params[2]);
@@ -956,7 +1024,7 @@ class ClientBase extends EventEmitter {
 		}
 		// Anything else
 		else {
-			switch(message.command) {
+			switch (message.command) {
 				case '353':
 					this.emit('names', message.params[2], message.params[3].split(' '));
 					break;
@@ -968,16 +1036,16 @@ class ClientBase extends EventEmitter {
 				case 'JOIN': {
 					const [ nick ] = message.prefix.split('!');
 					const matchesUsername = this.username === nick;
-					const isSelfAnon = matchesUsername && _.isJustinfan(this.getUsername());
+					const isSelfAnon = matchesUsername && utils.isJustinfan(this.getUsername());
 					// Joined a channel as a justinfan (anonymous) user
-					if(isSelfAnon) {
+					if (isSelfAnon) {
 						this.lastJoined = channel;
 						this.channels.push(channel);
 						this.log.info(`Joined ${channel}`);
 						this.emit('join', channel, nick, true);
 					}
 					// Someone else joined the channel, just emit the join event
-					else if(!matchesUsername) {
+					else if (!matchesUsername) {
 						this.emit('join', channel, nick, false);
 					}
 					break;
@@ -988,19 +1056,19 @@ class ClientBase extends EventEmitter {
 					const [ nick ] = message.prefix.split('!');
 					const isSelf = this.username === nick;
 					// Client left a channel
-					if(isSelf) {
-						if(this.userstate[channel]) {
+					if (isSelf) {
+						if (this.userstate[channel]) {
 							delete this.userstate[channel];
 						}
 
 						let index = this.channels.indexOf(channel);
-						if(index !== -1) {
+						if (index !== -1) {
 							this.channels.splice(index, 1);
 						}
 
-						index = this.opts.channels.indexOf(channel);
-						if(index !== -1) {
-							this.opts.channels.splice(index, 1);
+						index = this.opts.channels!.indexOf(channel);
+						if (index !== -1) {
+							this.opts.channels!.splice(index, 1);
 						}
 
 						this.log.info(`Left ${channel}`);
@@ -1018,12 +1086,12 @@ class ClientBase extends EventEmitter {
 					this.log.info(`[WHISPER] <${nick}>: ${msg}`);
 
 					// Update the tags to provide the username
-					if(!_.hasOwn(message.tags, 'username')) {
+					if (!utils.hasOwn(message.tags, 'username')) {
 						message.tags.username = nick;
 					}
 					message.tags['message-type'] = 'whisper';
 
-					const from = _.channel(message.tags.username);
+					const from = utils.channel(message.tags.username as string) as ChannelName;
 					// Emit for both, whisper and message
 					this.emits([ 'whisper', 'message' ], [
 						[ from, message.tags, msg, false ]
@@ -1036,16 +1104,16 @@ class ClientBase extends EventEmitter {
 					[ message.tags.username ] = message.prefix.split('!');
 
 					// Message from JTV
-					if(message.tags.username === 'jtv') {
-						const name = _.username(msg.split(' ')[0]);
-						const autohost = msg.includes('auto');
+					if (message.tags.username === 'jtv') {
+						const name = utils.username((msg || '').split(' ')[0]);
+						const autohost = (msg || '').includes('auto');
 						// Someone is hosting the channel and the message contains how many viewers
-						if(msg.includes('hosting you for')) {
+						if ((msg || '').includes('hosting you for')) {
 							let count = 0;
-							const parts = msg.split(' ');
-							for(let i = 0; i < parts.length; i++) {
-								if(_.isInteger(parts[i])) {
-									count = ~~parts[i];
+							const parts = (msg || '').split(' ');
+							for (let i = 0; i < parts.length; i++) {
+								if (utils.isInteger(parts[i])) {
+									count = ~~+parts[i];
 									break;
 								}
 							}
@@ -1054,44 +1122,39 @@ class ClientBase extends EventEmitter {
 						}
 
 						// Some is hosting the channel, but no viewer(s) count provided in the message
-						else if(msg.includes('hosting you')) {
+						else if ((msg || '').includes('hosting you')) {
 							this.emit('hosted', channel, name, 0, autohost);
 						}
-					}
-					else {
-						const messagesLogLevel = this.opts.options.messagesLogLevel ?? 'info';
+					} else {
+						const messagesLogLevel = this.opts.options?.messagesLogLevel ?? 'info';
 
 						// Message is an action (/me <message>)
-						const isActionMessage = _.actionMessage(msg);
+						const isActionMessage = utils.actionMessage(msg || '');
 						message.tags['message-type'] = isActionMessage ? 'action' : 'chat';
 						const cleanedMsg = isActionMessage ? isActionMessage[1] : msg;
 						// Check for Bits prior to actions message
-						if(_.hasOwn(message.tags, 'bits')) {
+						if (utils.hasOwn(message.tags, 'bits')) {
 							this.emit('cheer', channel, message.tags, cleanedMsg);
-						}
-						else {
+						} else {
 							//Handle Channel Point Redemptions (Require's Text Input)
-							if(_.hasOwn(message.tags, 'msg-id')) {
-								if(message.tags['msg-id'] === 'highlighted-message') {
-									const rewardtype = message.tags['msg-id'];
+							if (utils.hasOwn(message.tags, 'msg-id')) {
+								if (message.tags['msg-id'] === 'highlighted-message') {
+									const rewardtype = message.tags['msg-id'] as string;
+									this.emit('redeem', channel, message.tags.username, rewardtype, message.tags, cleanedMsg);
+								} else if (message.tags['msg-id'] === 'skip-subs-mode-message') {
+									const rewardtype = message.tags['msg-id'] as string;
 									this.emit('redeem', channel, message.tags.username, rewardtype, message.tags, cleanedMsg);
 								}
-								else if(message.tags['msg-id'] === 'skip-subs-mode-message') {
-									const rewardtype = message.tags['msg-id'];
-									this.emit('redeem', channel, message.tags.username, rewardtype, message.tags, cleanedMsg);
-								}
-							}
-							else if(_.hasOwn(message.tags, 'custom-reward-id')) {
-								const rewardtype = message.tags['custom-reward-id'];
+							} else if (utils.hasOwn(message.tags, 'custom-reward-id')) {
+								const rewardtype = message.tags['custom-reward-id'] as string;
 								this.emit('redeem', channel, message.tags.username, rewardtype, message.tags, cleanedMsg);
 							}
-							if(isActionMessage) {
+							if (isActionMessage) {
 								this.log[messagesLogLevel](`[${channel}] *<${message.tags.username}>: ${cleanedMsg}`);
 								this.emits([ 'action', 'message' ], [
 									[ channel, message.tags, cleanedMsg, false ]
 								]);
 							}
-
 
 							// Message is a regular chat message
 							else {
@@ -1110,56 +1173,57 @@ class ClientBase extends EventEmitter {
 			}
 		}
 	}
+
 	// Connect to server
-	connect() {
+	connect(): Promise<[string, number]> {
 		return new Promise((resolve, reject) => {
-			this.server = this.opts.connection.server ?? 'irc-ws.chat.twitch.tv';
-			this.port = this.opts.connection.port ?? 80;
+			this.server = this.opts.connection?.server ?? 'irc-ws.chat.twitch.tv';
+			this.port = this.opts.connection?.port ?? 80;
 
 			// Override port if using a secure connection
-			if(this.secure) {
+			if (this.secure) {
 				this.port = 443;
 			}
-			if(this.port === 443) {
+			if (this.port === 443) {
 				this.secure = true;
 			}
 
 			this.reconnectTimer = this.reconnectTimer * this.reconnectDecay;
-			if(this.reconnectTimer >= this.maxReconnectInterval) {
+			if (this.reconnectTimer >= this.maxReconnectInterval) {
 				this.reconnectTimer = this.maxReconnectInterval;
 			}
 
 			// Connect to server from configuration
 			this._openConnection();
-			this.once('_promiseConnect', err => {
-				if(!err) {
+			this.once('_promiseConnect', (err: any) => {
+				if (!err) {
 					resolve([ this.server, ~~this.port ]);
-				}
-				else {
+				} else {
 					reject(err);
 				}
 			});
 		});
 	}
+
 	// Open a connection
-	_openConnection() {
+	_openConnection(): void {
 		const url = `${this.secure ? 'wss' : 'ws'}://${this.server}:${this.port}/`;
-		/** @type {import('ws').ClientOptions} */
-		const connectionOptions = {};
-		if('agent' in this.opts.connection) {
+		const connectionOptions: any = {};
+		if (this.opts.connection && 'agent' in this.opts.connection) {
 			connectionOptions.agent = this.opts.connection.agent;
 		}
-		this.ws = new _WebSocket(url, 'irc', connectionOptions);
+		this.ws = new _WebSocket(url, 'irc', connectionOptions) as any;
 
-		this.ws.onmessage = this._onMessage.bind(this);
-		this.ws.onerror = this._onError.bind(this);
-		this.ws.onclose = this._onClose.bind(this);
-		this.ws.onopen = this._onOpen.bind(this);
+		this.ws!.onmessage = this._onMessage.bind(this);
+		this.ws!.onerror = this._onError.bind(this);
+		this.ws!.onclose = this._onClose.bind(this);
+		this.ws!.onopen = this._onOpen.bind(this);
 	}
+
 	// Called when the WebSocket connection's readyState changes to OPEN.
 	// Indicates that the connection is ready to send and receive data
-	_onOpen() {
-		if(!this._isConnected()) {
+	_onOpen(): void {
+		if (!this._isConnected()) {
 			return;
 		}
 
@@ -1167,71 +1231,73 @@ class ClientBase extends EventEmitter {
 		this.log.info(`Connecting to ${this.server} on port ${this.port}..`);
 		this.emit('connecting', this.server, ~~this.port);
 
-		this.username = _.username(this.opts.identity.username ?? _.justinfan());
+		this.username = utils.username(this.opts.identity?.username ?? utils.justinfan());
 		this._getToken()
-		.then(token => {
-			const password = _.password(token);
+			.then(token => {
+				const password = utils.password(token);
 
-			// Emitting "logon" event
-			this.log.info('Sending authentication to server..');
-			this.emit('logon');
+				// Emitting "logon" event
+				this.log.info('Sending authentication to server..');
+				this.emit('logon');
 
-			let caps = 'twitch.tv/tags twitch.tv/commands';
-			if(!this._skipMembership) {
-				caps += ' twitch.tv/membership';
-			}
-			this.ws.send(`CAP REQ :${caps}`);
+				let caps = 'twitch.tv/tags twitch.tv/commands';
+				if (!this._skipMembership) {
+					caps += ' twitch.tv/membership';
+				}
+				this.ws!.send(`CAP REQ :${caps}`);
 
-			// Authentication
-			if(password) {
-				this.ws.send(`PASS ${password}`);
-			}
-			else if(_.isJustinfan(this.username)) {
-				this.ws.send('PASS SCHMOOPIIE');
-			}
-			this.ws.send(`NICK ${this.username}`);
-		})
-		.catch(err => {
-			this.emits([ '_promiseConnect', 'disconnected' ], [ [ err ], [ 'Could not get a token.' ] ]);
-		});
+				// Authentication
+				if (password) {
+					this.ws!.send(`PASS ${password}`);
+				} else if (utils.isJustinfan(this.username)) {
+					this.ws!.send('PASS SCHMOOPIIE');
+				}
+				this.ws!.send(`NICK ${this.username}`);
+			})
+			.catch(err => {
+				this.emits([ '_promiseConnect', 'disconnected' ], [ [ err ], [ 'Could not get a token.' ] ]);
+			});
 	}
+
 	// Fetches a token from the option.
-	_getToken() {
-		const passwordOption = this.opts.identity.password;
+	_getToken(): Promise<string> {
+		const passwordOption = this.opts.identity?.password;
 		const password = typeof passwordOption === 'function' ? passwordOption() : passwordOption;
-		return Promise.resolve(password);
+		return Promise.resolve(password || '');
 	}
+
 	// Called when a message is received from the server
-	_onMessage(event) {
-		const parts = event.data.trim().split('\r\n');
+	_onMessage(event: MessageEvent): void {
+		const parts = (event.data as string).trim().split('\r\n');
 
 		parts.forEach(str => {
 			const msg = parser.msg(str);
-			if(msg) {
+			if (msg) {
 				this.handleMessage(msg);
 			}
 		});
 	}
+
 	// Called when an error occurs
-	_onError() {
+	_onError(): void {
 		this.moderators = {};
 		this.userstate = {};
 		this.globaluserstate = {};
 
 		// Stop the internal ping timeout check interval
-		clearInterval(this.pingLoop);
-		clearTimeout(this.pingTimeout);
+		clearInterval(this.pingLoop!);
+		clearTimeout(this.pingTimeout!);
 
 		this.reason = this.ws === null ? 'Connection closed.' : 'Unable to connect.';
 
 		this.emits([ '_promiseConnect', 'disconnected' ], [ [ this.reason ] ]);
 
 		// Reconnect to server
-		if(this.reconnect && this.reconnections === this.maxReconnectAttempts) {
+		if (this.reconnect && this.reconnections === this.maxReconnectAttempts) {
 			this.emit('maxreconnect');
 			this.log.error('Maximum reconnection attempts reached.');
 		}
-		if(this.reconnect && !this.reconnecting && this.reconnections <= this.maxReconnectAttempts - 1) {
+		if (this.reconnect && !this.reconnecting && this.reconnections <= this.maxReconnectAttempts - 1) {
 			this.reconnecting = true;
 			this.reconnections++;
 			this.log.error(`Reconnecting in ${Math.round(this.reconnectTimer / 1000)} seconds..`);
@@ -1244,35 +1310,35 @@ class ClientBase extends EventEmitter {
 
 		this.ws = null;
 	}
+
 	// Called when the WebSocket connection's readyState changes to CLOSED
-	_onClose() {
+	_onClose(): void {
 		this.moderators = {};
 		this.userstate = {};
 		this.globaluserstate = {};
 
 		// Stop the internal ping timeout check interval
-		clearInterval(this.pingLoop);
-		clearTimeout(this.pingTimeout);
+		clearInterval(this.pingLoop!);
+		clearTimeout(this.pingTimeout!);
 
 		// User called .disconnect(), don't try to reconnect.
-		if(this.wasCloseCalled) {
+		if (this.wasCloseCalled) {
 			this.wasCloseCalled = false;
 			this.reason = 'Connection closed.';
 			this.log.info(this.reason);
 			this.emits([ '_promiseConnect', '_promiseDisconnect', 'disconnected' ], [ [ this.reason ], [ null ], [ this.reason ] ]);
 		}
 
-
 		// Got disconnected from server
 		else {
 			this.emits([ '_promiseConnect', 'disconnected' ], [ [ this.reason ] ]);
 
 			// Reconnect to server
-			if(!this.wasCloseCalled && this.reconnect && this.reconnections === this.maxReconnectAttempts) {
+			if (!this.wasCloseCalled && this.reconnect && this.reconnections === this.maxReconnectAttempts) {
 				this.emit('maxreconnect');
 				this.log.error('Maximum reconnection attempts reached.');
 			}
-			if(!this.wasCloseCalled && this.reconnect && !this.reconnecting && this.reconnections <= this.maxReconnectAttempts - 1) {
+			if (!this.wasCloseCalled && this.reconnect && !this.reconnecting && this.reconnections <= this.maxReconnectAttempts - 1) {
 				this.reconnecting = true;
 				this.reconnections++;
 				this.log.error(`Could not connect to server. Reconnecting in ${Math.round(this.reconnectTimer / 1000)} seconds..`);
@@ -1286,95 +1352,104 @@ class ClientBase extends EventEmitter {
 
 		this.ws = null;
 	}
+
 	// Minimum of 600ms for command promises, if current latency exceeds, add 100ms to it to make sure it doesn't get timed out
-	_getPromiseDelay() {
+	_getPromiseDelay(): number {
 		return Math.max(600, this.currentLatency * 1000 + 100);
 	}
+
 	// Send command to server or channel
-	_sendCommand({ delay, channel, command, tags }, fn) {
+	_sendCommand(
+		opts: SendCommandOptions,
+		fn?: (resolve: (value?: any) => void, reject: (reason?: any) => void) => void
+	): Promise<any> {
 		// Race promise against delay
 		return new Promise((resolve, reject) => {
 			// Make sure the socket is opened
-			if(!this._isConnected()) {
+			if (!this._isConnected()) {
 				// Disconnected from server
 				return reject('Not connected to server.');
-			}
-			else if(delay === null || typeof delay === 'number') {
-				if(delay === null) {
+			} else if (opts.delay === null || typeof opts.delay === 'number') {
+				let delay = opts.delay;
+				if (delay === null) {
 					delay = this._getPromiseDelay();
 				}
-				_.promiseDelay(delay).then(() => reject('No response from Twitch.'));
+				utils.promiseDelay(delay).then(() => reject('No response from Twitch.'));
 			}
 
-			const formedTags = parser.formTags(tags);
+			const formedTags = parser.formTags(opts.tags);
 
 			// Executing a command on a channel
-			if(typeof channel === 'string') {
-				const chan = _.channel(channel);
-				this.log.info(`[${chan}] Executing command: ${command}`);
-				this.ws.send(`${formedTags ? `${formedTags} ` : ''}PRIVMSG ${chan} :${command}`);
+			if (typeof opts.channel === 'string') {
+				const chan = utils.channel(opts.channel);
+				this.log.info(`[${chan}] Executing command: ${opts.command}`);
+				this.ws!.send(`${formedTags ? `${formedTags} ` : ''}PRIVMSG ${chan} :${opts.command}`);
 			}
 
 			// Executing a raw command
 			else {
-				this.log.info(`Executing command: ${command}`);
-				this.ws.send(`${formedTags ? `${formedTags} ` : ''}${command}`);
+				this.log.info(`Executing command: ${opts.command}`);
+				this.ws!.send(`${formedTags ? `${formedTags} ` : ''}${opts.command}`);
 			}
-			if(typeof fn === 'function') {
+			if (typeof fn === 'function') {
 				fn(resolve, reject);
-			}
-			else {
-				resolve();
+			} else {
+				resolve(undefined);
 			}
 		});
 	}
+
 	// Send a message to channel
-	_sendMessage({ channel, message, tags }, fn) {
+	_sendMessage(
+		opts: SendMessageOptions,
+		fn?: (resolve: (value?: any) => void, reject: (reason?: any) => void) => void
+	): Promise<any> {
 		// Promise a result
 		return new Promise((resolve, reject) => {
 			// Make sure the socket is opened and not logged in as a justinfan user
-			if(!this._isConnected()) {
+			if (!this._isConnected()) {
 				return reject('Not connected to server.');
-			}
-			else if(_.isJustinfan(this.getUsername())) {
+			} else if (utils.isJustinfan(this.getUsername())) {
 				return reject('Cannot send anonymous messages.');
 			}
-			const chan = _.channel(channel);
-			if(!this.userstate[chan]) {
+			const chan = utils.channel(opts.channel) as ChannelName;
+			if (!this.userstate[chan]) {
 				this.userstate[chan] = {};
 			}
 
+			let message = opts.message;
+
 			// Split long lines otherwise they will be eaten by the server
-			if(message.length > 500) {
+			if (message.length > 500) {
 				const maxLength = 500;
 				const msg = message;
 				let lastSpace = msg.slice(0, maxLength).lastIndexOf(' ');
 				// No spaces found, split at the very end to avoid a loop
-				if(lastSpace === -1) {
+				if (lastSpace === -1) {
 					lastSpace = maxLength;
 				}
 				message = msg.slice(0, lastSpace);
 
 				setTimeout(() =>
-					this._sendMessage({ channel, message: msg.slice(lastSpace), tags })
-				, 350);
+					this._sendMessage({ channel: opts.channel, message: msg.slice(lastSpace), tags: opts.tags })
+					, 350);
 			}
 
-			const formedTags = parser.formTags(tags);
-			this.ws.send(`${formedTags ? `${formedTags} ` : ''}PRIVMSG ${chan} :${message}`);
+			const formedTags = parser.formTags(opts.tags);
+			this.ws!.send(`${formedTags ? `${formedTags} ` : ''}PRIVMSG ${chan} :${message}`);
 
 			// Merge userstate with parsed emotes
-			const userstate = Object.assign(
+			const userstate: any = Object.assign(
 				{},
 				this.userstate[chan],
 				{ emotes: null }
 			);
 
-			const messagesLogLevel = this.opts.options.messagesLogLevel ?? 'info';
+			const messagesLogLevel = this.opts.options?.messagesLogLevel ?? 'info';
 
 			// Message is an action (/me <message>)
-			const actionMessage = _.actionMessage(message);
-			if(actionMessage) {
+			const actionMessage = utils.actionMessage(message);
+			if (actionMessage) {
 				userstate['message-type'] = 'action';
 				this.log[messagesLogLevel](`[${chan}] *<${this.getUsername()}>: ${actionMessage[1]}`);
 				this.emits([ 'action', 'message' ], [
@@ -1390,60 +1465,68 @@ class ClientBase extends EventEmitter {
 					[ chan, userstate, message, true ]
 				]);
 			}
-			if(typeof fn === 'function') {
+			if (typeof fn === 'function') {
 				fn(resolve, reject);
-			}
-			else {
-				resolve();
+			} else {
+				resolve(undefined);
 			}
 		});
 	}
+
 	// Get current username
-	getUsername() {
+	getUsername(): string {
 		return this.username;
 	}
+
 	// Get current options
-	getOptions() {
+	getOptions(): ClientOptions {
 		return this.opts;
 	}
+
 	// Get current channels
-	getChannels() {
+	getChannels(): ChannelName[] {
 		return this.channels;
 	}
+
 	// Check if username is a moderator on a channel
-	isMod(channel, username) {
-		const chan = _.channel(channel);
-		if(!this.moderators[chan]) {
+	isMod(channel: string, username: string): boolean {
+		const chan = utils.channel(channel) as ChannelName;
+		if (!this.moderators[chan]) {
 			this.moderators[chan] = [];
 		}
-		return this.moderators[chan].includes(_.username(username));
+		return this.moderators[chan].includes(utils.username(username));
 	}
+
 	// Get readyState
-	readyState() {
-		if(this.ws === null) {
+	readyState(): string {
+		if (this.ws === null) {
 			return 'CLOSED';
 		}
 		return [ 'CONNECTING', 'OPEN', 'CLOSING', 'CLOSED' ][this.ws.readyState];
 	}
+
 	// Determine if the client has a WebSocket and it's open
-	_isConnected() {
+	_isConnected(): boolean {
 		return this.ws !== null && this.ws.readyState === 1;
 	}
+
 	// Disconnect from server
-	disconnect() {
+	disconnect(): Promise<[string, number]> {
 		return new Promise((resolve, reject) => {
-			if(this.ws !== null && this.ws.readyState !== 3) {
+			if (this.ws !== null && this.ws.readyState !== 3) {
 				this.wasCloseCalled = true;
 				this.log.info('Disconnecting from server..');
 				this.ws.close();
 				this.once('_promiseDisconnect', () => resolve([ this.server, ~~this.port ]));
-			}
-			else {
+			} else {
 				this.log.error('Cannot disconnect from server. Socket is not opened or connection is already closing.');
 				reject('Cannot disconnect from server. Socket is not opened or connection is already closing.');
 			}
 		});
 	}
-}
 
-module.exports = ClientBase;
+	// Join a channel - to be overridden by Client
+	join(_channel: string): Promise<[ChannelName]> {
+		return Promise.reject('join() must be implemented by subclass');
+	}
+}

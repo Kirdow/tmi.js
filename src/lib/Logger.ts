@@ -1,14 +1,18 @@
-/// <reference path="../types.d.ts" />
+export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
 
 // Logger implementation
-class Logger {
+export default class Logger {
+	private _levels: Record<LogLevel, number>;
+	private _currentLevel: LogLevel;
+
 	constructor() {
 		this._levels = { trace: 0, debug: 1, info: 2, warn: 3, error: 4, fatal: 5 };
 		this._currentLevel = 'error';
 	}
+
 	// Log a console message depending on the logging level
-	_log(level, message) {
-		if(this._levels[level] < this._levels[this._currentLevel]) {
+	private _log(level: LogLevel, message: string): void {
+		if (this._levels[level] < this._levels[this._currentLevel]) {
 			return;
 		}
 		// Format the date
@@ -18,32 +22,38 @@ class Logger {
 		const dateFormatted = `${(h < 10 ? '0' : '') + h}:${(m < 10 ? '0' : '') + m}`;
 		console.log(`[${dateFormatted}] ${level}: ${message}`);
 	}
+
 	// Change the current logging level
-	setLevel(level) {
+	setLevel(level: LogLevel): void {
 		this._currentLevel = level;
 	}
+
 	// Get the current logging level
-	getLevel() {
+	getLevel(): LogLevel {
 		return this._currentLevel;
 	}
-	trace(message) {
+
+	trace(message: string): void {
 		this._log('trace', message);
 	}
-	debug(message) {
+
+	debug(message: string): void {
 		this._log('debug', message);
 	}
-	info(message) {
+
+	info(message: string): void {
 		this._log('info', message);
 	}
-	warn(message) {
+
+	warn(message: string): void {
 		this._log('warn', message);
 	}
-	error(message) {
+
+	error(message: string): void {
 		this._log('error', message);
 	}
-	fatal(message) {
+
+	fatal(message: string): void {
 		this._log('fatal', message);
 	}
 }
-
-module.exports = Logger;

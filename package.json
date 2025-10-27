@@ -12,43 +12,45 @@
     "interface",
     "bot"
   ],
-  "main": "index.js",
-  "types": "types.d.ts",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "files": [
-    "lib",
     "dist",
-    "index.js",
-    "types.d.ts"
+    "browser"
   ],
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=18.0.0"
   },
   "author": "Schmoopiie",
   "scripts": {
-    "test": "npm run test:eslint && npm run test:mocha",
-    "test:eslint": "eslint index.js lib/* test/*",
-    "eslint-fix": "eslint --fix index.js lib/* test/*",
-    "test:mocha": "nyc mocha --require should --exit",
-    "build": "npm run build:esbuild && npm run build:sri",
-    "build:esbuild": "node ./scripts/esbuild.js && node ./scripts/esbuild.js minify",
-    "build:sri": "node scripts/sri.js dist/tmi.js && node scripts/sri.js dist/tmi.min.js"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "npm run build:clean && npm run build:tsc && npm run build:browser",
+    "build:clean": "rm -rf dist browser",
+    "build:tsc": "tsc",
+    "build:browser": "node ./scripts/esbuild.js && node ./scripts/esbuild.js minify",
+    "build:sri": "node scripts/sri.js browser/tmi.js && node scripts/sri.js browser/tmi.min.js",
+    "typecheck": "tsc --noEmit"
   },
   "license": "MIT",
   "repository": "tmijs/tmi.js",
   "bugs": "https://github.com/tmijs/tmi.js/issues",
   "dependencies": {
-    "ws": "8.8.0"
+    "ws": "8.18.0"
   },
   "devDependencies": {
-    "esbuild": "0.14.47",
-    "eslint": "8.18.0",
-    "hook-std": "2.0.0",
-    "mocha": "10.0.0",
-    "nyc": "15.1.0",
-    "should": "13.2.3"
-  },
-  "browser": {
-    "ws": false
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.10",
+    "esbuild": "^0.20.0",
+    "typescript": "5.4.5",
+    "vitest": "^1.2.0"
   },
   "funding": [
     {

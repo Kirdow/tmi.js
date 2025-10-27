@@ -1,12 +1,12 @@
-const esbuild = require('esbuild');
+import * as esbuild from 'esbuild';
 
 /** @type {esbuild.BuildOptions} */
 const settingsBase = {
-	entryPoints: [ 'index.js' ],
+	entryPoints: [ 'dist/index.js' ],
 	bundle: true,
-	outdir: 'dist',
+	outdir: 'browser',
 	entryNames: 'tmi',
-	target: 'es2018',
+	target: 'es2020',
 	format: 'iife',
 	globalName: 'tmi',
 };
