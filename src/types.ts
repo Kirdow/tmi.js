@@ -203,6 +203,8 @@ export interface ChatUserstate extends GlobalUserstate {
 	'room-id': string;
 	'user-id': string;
 	username: string;
+    'first-chat'?: boolean;
+    'returning-chatter'?: boolean;
 	'message-type': 'chat' | 'action' | 'whisper';
 }
 
