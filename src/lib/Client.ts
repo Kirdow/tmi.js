@@ -84,25 +84,61 @@ export default class Client extends ClientBase {
 		);
 	}
 
-	override join(channel: string): Promise<[ChannelName]> {
-		channel = utils.channel(channel);
-		return this._sendCommand({ delay: undefined, channel: undefined, command: `JOIN ${channel}` }, (res, rej) => {
+	override join(channel: string | string[]): Promise<[ChannelName] | ChannelName[]> {
+		// Handle both single channel and array of channels
+		const channels = Array.isArray(channel) ? channel : [channel];
+		const normalizedChannels = channels.map(ch => utils.channel(ch));
+		const joinCommand = `JOIN ${normalizedChannels.join(',')}`;
+
+		return this._sendCommand({ delay: undefined, channel: undefined, command: joinCommand }, (res, rej) => {
 			const eventName = '_promiseJoin';
 			let hasFulfilled = false;
+
+			// Track which channels have joined successfully
+			const joinedChannels = new Set<string>();
+			const expectedChannels = new Set(normalizedChannels);
+
 			const listener = (err: any, joinedChannel: string) => {
-				if (channel === utils.channel(joinedChannel)) {
-					// Received _promiseJoin event for the target channel
-					this.removeListener(eventName, listener);
-					hasFulfilled = true;
-					!err ? res([ channel as ChannelName ]) : rej(err);
+				const normalizedJoinedChannel = utils.channel(joinedChannel);
+
+				// Check if this is one of our target channels
+				if (expectedChannels.has(normalizedJoinedChannel)) {
+					if (err) {
+						// If any channel fails to join, reject the promise
+						this.removeListener(eventName, listener);
+						hasFulfilled = true;
+						rej(err);
+						return;
+					}
+
+					// Mark this channel as joined
+					joinedChannels.add(normalizedJoinedChannel);
+
+					// Check if all channels have joined
+					if (joinedChannels.size === expectedChannels.size) {
+						this.removeListener(eventName, listener);
+						hasFulfilled = true;
+
+						// Return array if multiple channels, single element array if one channel
+						const result = Array.from(joinedChannels) as ChannelName[];
+						res(Array.isArray(channel) ? result : [result[0]]);
+					}
 				}
 			};
+
 			this.on(eventName, listener);
-			// Race the Promise against a delay
-			const delay = this._getPromiseDelay();
+
+			// Race the Promise against a delay (multiply by number of channels for multiple joins)
+			const delay = this._getPromiseDelay() * normalizedChannels.length;
 			utils.promiseDelay(delay).then(() => {
 				if (!hasFulfilled) {
-					this.emit(eventName, 'No response from Twitch.', channel);
+					this.removeListener(eventName, listener);
+					// Report which channels failed to join
+					const failedChannels = normalizedChannels.filter(ch => !joinedChannels.has(ch));
+					const errorMsg = failedChannels.length === normalizedChannels.length
+						? `No response from Twitch for any channels.`
+						: `No response from Twitch for channels: ${failedChannels.join(', ')}`;
+					this.emit(eventName, errorMsg, failedChannels[0] || normalizedChannels[0]);
 				}
 			});
 		});

@@ -1526,7 +1526,7 @@ export default class ClientBase extends EventEmitter {
 	}
 
 	// Join a channel - to be overridden by Client
-	join(_channel: string): Promise<[ChannelName]> {
+	join(_channel: string | string[]): Promise<[ChannelName] | ChannelName[]> {
 		return Promise.reject('join() must be implemented by subclass');
 	}
 }
